@@ -15,17 +15,20 @@ It uses the same mechanism as calling a plain function, and the docstring tells 
 
 from __future__ import annotations
 
+import json
 import os
+from functools import lru_cache
 from typing import Annotated
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import InjectedState
 
 from agents.prompts import get_prompt_template
 from agents.tools import check_shipment_status
+from retrieval.embed_kb import CHUNKS_PATH
 from retrieval.retrieve import retrieve
 from retrieval.search import HybridIndex
 
@@ -59,14 +62,15 @@ def tracking_agent_run(user_message: str) -> str:
     return response.content
 
 
-def compliance_agent_run(user_message: str) -> str:
+def compliance_agent_run(user_message: str) -> tuple[str, list[str]]:
+    """Returns the specialist's answer and the ids of the chunks it was given."""
     chunks = retrieve(_get_index(), user_message)
     context = "\n\n".join(f"[{c['chunk_id']}] {c['text']}" for c in chunks)
 
     llm = ChatOpenAI(model=MODEL, temperature=0)
     chain = get_prompt_template("compliance") | llm
     response = chain.invoke({"messages": [HumanMessage(content=user_message)], "context": context})
-    return response.content
+    return response.content, [c["chunk_id"] for c in chunks]
 
 
 def escalation_agent_run(conversation_summary: str) -> str:
@@ -90,8 +94,10 @@ def call_tracking_agent(state: Annotated[dict, InjectedState]) -> str:
     return tracking_agent_run(_latest_human_message(state))
 
 
-@tool
-def call_compliance_agent(state: Annotated[dict, InjectedState]) -> str:
+# content_and_artifact: the answer text is what the supervisor reads; the artifact
+# (the retrieved chunk ids) is stored on the ToolMessage but never sent to the LLM.
+@tool(response_format="content_and_artifact")
+def call_compliance_agent(state: Annotated[dict, InjectedState]) -> tuple[str, list[str]]:
     """Call when the question needs customs/import policy or FTC consumer-protection
     knowledge: duty or value thresholds, prohibited or restricted items, or refund
     rules for an order that never arrived."""
@@ -104,3 +110,45 @@ def call_escalation_agent(conversation_summary: str) -> str:
     a lost package the other specialists can't resolve, or a customer who seems to
     need a person. Pass a brief summary of the situation so far."""
     return escalation_agent_run(conversation_summary)
+
+
+SOURCES_MARKER = "\n\nSources:"
+
+
+@lru_cache(maxsize=1)
+def chunk_metadata() -> dict[str, dict]:
+    with CHUNKS_PATH.open(encoding="utf-8") as f:
+        return {c["chunk_id"]: c for c in (json.loads(line) for line in f)}
+
+
+def compliance_results(messages: list[BaseMessage]) -> list[tuple[str, list[str]]]:
+    """(answer, retrieved chunk ids) for every compliance call since the latest customer message."""
+    results = []
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            break
+        if isinstance(msg, ToolMessage) and msg.name == "call_compliance_agent" and msg.artifact:
+            results.append((msg.content, msg.artifact))
+    return list(reversed(results))
+
+
+def format_sources(messages: list[BaseMessage]) -> str:
+    """Source list for the final reply, built in code from chunk metadata (never by the LLM).
+
+    Lists only chunks the compliance specialist was given AND cited by id in its answer.
+    Returns "" when nothing was cited (e.g. the knowledge base didn't cover the question).
+    """
+    metadata = chunk_metadata()
+    lines: list[str] = []
+    for answer, retrieved_ids in compliance_results(messages):
+        for chunk_id in retrieved_ids:
+            if chunk_id not in answer:
+                continue
+            chunk = metadata[chunk_id]
+            name = chunk["title"]
+            if chunk.get("section_heading"):
+                name += f" ({chunk['section_heading']})"
+            line = f"- {name}: {chunk['url']}"
+            if line not in lines:
+                lines.append(line)
+    return SOURCES_MARKER + "\n" + "\n".join(lines) if lines else ""

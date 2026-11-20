@@ -22,7 +22,12 @@ from langgraph.graph import END, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from agents.prompts import get_prompt_template
-from agents.specialists import call_compliance_agent, call_escalation_agent, call_tracking_agent
+from agents.specialists import (
+    call_compliance_agent,
+    call_escalation_agent,
+    call_tracking_agent,
+    format_sources,
+)
 
 load_dotenv()
 MODEL = os.environ.get("AGENT_MODEL", "gpt-4o-mini")
@@ -34,6 +39,10 @@ _supervisor_llm = ChatOpenAI(model=MODEL, temperature=0).bind_tools(_tools)
 def supervisor_node(state: MessagesState) -> dict:
     chain = get_prompt_template("supervisor") | _supervisor_llm
     response = chain.invoke({"messages": state["messages"]})
+    if not response.tool_calls:  # final reply: append the sources the specialist cited
+        sources = format_sources(state["messages"])
+        if sources:
+            response = response.model_copy(update={"content": response.content + sources})
     return {"messages": [response]}
 
 

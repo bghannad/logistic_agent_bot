@@ -4,10 +4,11 @@ retrieved and/or (b) the mocked shipment data the tracking specialist used — o
 does it slip in outside knowledge?
 
 Method: LLM-as-judge. The judge sees the final reply plus the real source text
-(reconstructed independently in build_sources() — not pulled from inside the
-specialist, so this exercises the same inputs a specialist actually had, without
-needing to modify specialists.py to expose them) and flags any claim in the reply
-not backed by that source text. The judge never writes its own answer to compare
+and flags any claim in the reply not backed by that source text. The KB excerpts
+are exactly the chunks the compliance specialist was given in this run (read from
+the artifact on its ToolMessage, not retrieved again). The source list appended to
+the reply is removed before judging: it is built in code from chunk metadata, not
+written by the LLM. The judge never writes its own answer to compare
 against — it only grades ours. This is a faithfulness/groundedness check, not an
 answer-correctness check, because there's no single correct reference answer to
 compare against for most of these questions.
@@ -31,10 +32,9 @@ from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
 from agents.graph import build_graph
+from agents.specialists import SOURCES_MARKER, chunk_metadata, compliance_results
 from agents.tools import check_shipment_status
 from eval.routing_eval import called_specialists
-from retrieval.retrieve import retrieve
-from retrieval.search import HybridIndex
 
 load_dotenv()
 MODEL = os.environ.get("AGENT_MODEL", "gpt-4o-mini")
@@ -43,6 +43,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CASES_PATH = REPO_ROOT / "data" / "eval" / "groundedness_cases.jsonl"
 
 TRACKING_REF_RE = re.compile(r"TRK\d+")
+CHUNK_ID_RE = re.compile(r"\b[a-z0-9_]+__\d{3}\b")
 
 JUDGE_SYSTEM_PROMPT = (
     "You are a strict fact-checker reviewing a customer-support assistant's reply. "
@@ -78,12 +79,14 @@ def load_cases() -> list[dict]:
         return [json.loads(line) for line in f]
 
 
-def build_sources(message: str, specialists: set[str], index: HybridIndex) -> str:
+def build_sources(message: str, messages: list, specialists: set[str]) -> str:
     sources = []
+    metadata = chunk_metadata()
 
-    if "call_compliance_agent" in specialists:
-        chunks = retrieve(index, message)
-        excerpt_text = "\n\n".join(f"[{c['chunk_id']}] {c['text']}" for c in chunks)
+    retrieved_ids = [cid for _, ids in compliance_results(messages) for cid in ids]
+    if retrieved_ids:
+        unique_ids = list(dict.fromkeys(retrieved_ids))
+        excerpt_text = "\n\n".join(f"[{cid}] {metadata[cid]['text']}" for cid in unique_ids)
         sources.append(f"KB EXCERPTS:\n{excerpt_text}")
 
     if "call_tracking_agent" in specialists:
@@ -93,6 +96,16 @@ def build_sources(message: str, specialists: set[str], index: HybridIndex) -> st
             sources.append(f"MOCKED SHIPMENT LOOKUP for {match.group()}: {result}")
 
     return "\n\n".join(sources)
+
+
+def citation_check(messages: list) -> tuple[int, int]:
+    """(chunk ids the compliance specialist cited, of those how many it was NOT given)."""
+    cited = invented = 0
+    for answer, retrieved_ids in compliance_results(messages):
+        for cid in set(CHUNK_ID_RE.findall(answer)):
+            cited += 1
+            invented += cid not in retrieved_ids
+    return cited, invented
 
 
 def judge(llm: ChatOpenAI, source_text: str, reply: str) -> tuple[bool, str]:
@@ -109,16 +122,18 @@ def judge(llm: ChatOpenAI, source_text: str, reply: str) -> tuple[bool, str]:
 def main() -> None:
     cases = load_cases()
     graph = build_graph()
-    index = HybridIndex()
     judge_llm = ChatOpenAI(model=MODEL, temperature=0)
 
     graded = 0
     grounded_count = 0
+    total_cited = 0
+    total_invented = 0
 
     for case in cases:
         result = graph.invoke({"messages": [HumanMessage(content=case["message"])]})
         specialists = called_specialists(result["messages"])
         reply = result["messages"][-1].content
+        reply_text = reply.split(SOURCES_MARKER)[0]  # judge the LLM's words, not the code-built source list
 
         print(f"[{case['id']}] ({case['category']}) {case['message']}")
         print(f"  reply: {reply}")
@@ -127,15 +142,21 @@ def main() -> None:
             print("  skipped — no compliance/tracking specialist called, nothing to check\n")
             continue
 
-        source_text = build_sources(case["message"], specialists, index)
-        is_grounded, verdict_text = judge(judge_llm, source_text, reply)
+        source_text = build_sources(case["message"], result["messages"], specialists)
+        is_grounded, verdict_text = judge(judge_llm, source_text, reply_text)
         graded += 1
         grounded_count += is_grounded
 
-        print(f"  {verdict_text}\n")
+        cited, invented = citation_check(result["messages"])
+        total_cited += cited
+        total_invented += invented
+
+        print(f"  {verdict_text}")
+        print(f"  citations: {cited} chunk id(s) cited by the specialist, {invented} not among its retrieved chunks\n")
 
     if graded:
         print(f"Grounded: {grounded_count}/{graded} graded cases ({grounded_count / graded:.0%})")
+        print(f"Citations: {total_cited} cited chunk ids, {total_invented} not among the retrieved chunks")
     else:
         print("No cases were graded.")
 
