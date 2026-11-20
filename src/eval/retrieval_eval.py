@@ -6,7 +6,7 @@ Three metrics per case, all computed against the same top-5 result:
 - Hit@5: did at least one expected chunk appear anywhere in the top 5? (binary)
 - Precision@5: of the 5 chunks returned, what fraction were actually expected?
 - Recall@5: of the chunks that were expected, what fraction did we actually get?
-    Only matters for the handful of cases with 2 expected chunk_ids (a topic that
+    Only matters for the cases with 2 or more expected chunk_ids (a topic that
     got split across chunks) — recall can be < 1 there even on a "hit."
 
 Usage (from repo root, with .venv active):
