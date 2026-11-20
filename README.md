@@ -31,7 +31,7 @@ mocked tool      hybrid search (BM25 +          human-handoff
 
 The model itself decides which specialists to call (real tool-calling, not a hardcoded `if`), The tracking and compliance specialists read the customer's original message from LangGraph's injected state rather than from a model-generated argument, so a compound question can't get silently split or paraphrased on its way to them. The escalation specialist instead receives a short summary written by the supervisor, because its decision depends on the whole conversation, not only the latest message.
 
-When a reply uses the knowledge base, it ends with a source list (page title, section and URL) for the chunks the compliance specialist cited. The list is built in code from the chunk metadata, not written by the model, so links can't be invented. The compliance tool also returns the ids of all retrieved chunks as a LangChain tool artifact, stored on its ToolMessage but not sent to the model, so the groundedness eval can judge each reply against exactly the chunks that run used.
+When a reply uses the knowledge base, it ends with a source list (page title, section and URL) for the chunks the compliance specialist cited. The list is built in code from the chunk metadata, not written by the model, so links can't be invented. The compliance and tracking tools also return what they were given (the retrieved chunk ids, the raw lookup results) as LangChain tool artifacts, stored on their ToolMessages but not sent to the model. The groundedness eval reads these, so it judges each specialist's answer and the supervisor's final reply separately, against exactly what that run used.
 
 ## Tech stack
 

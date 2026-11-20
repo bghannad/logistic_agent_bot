@@ -45,21 +45,24 @@ def _get_index() -> HybridIndex:
     return _hybrid_index
 
 
-def tracking_agent_run(user_message: str) -> str:
+def tracking_agent_run(user_message: str) -> tuple[str, list[str]]:
+    """Returns the specialist's answer and the raw results of every status lookup it made."""
     llm = ChatOpenAI(model=MODEL, temperature=0).bind_tools([check_shipment_status])
     chain = get_prompt_template("tracking") | llm
 
     messages = [HumanMessage(content=user_message)]
     response = chain.invoke({"messages": messages})
 
+    lookups: list[str] = []
     if response.tool_calls:
         messages.append(response)
         for call in response.tool_calls:
             result = check_shipment_status.invoke(call["args"])
+            lookups.append(f"{call['args'].get('tracking_ref')}: {result}")
             messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
         response = chain.invoke({"messages": messages})
 
-    return response.content
+    return response.content, lookups
 
 
 def compliance_agent_run(user_message: str) -> tuple[str, list[str]]:
@@ -87,15 +90,16 @@ def _latest_human_message(state: dict) -> str:
     return ""
 
 
-@tool
-def call_tracking_agent(state: Annotated[dict, InjectedState]) -> str:
+@tool(response_format="content_and_artifact")
+def call_tracking_agent(state: Annotated[dict, InjectedState]) -> tuple[str, list[str]]:
     """Call when the customer's message is about real-time shipment status: where a
     package is, delays, a customs hold, or a delivery attempt."""
     return tracking_agent_run(_latest_human_message(state))
 
 
-# content_and_artifact: the answer text is what the supervisor reads; the artifact
-# (the retrieved chunk ids) is stored on the ToolMessage but never sent to the LLM.
+# content_and_artifact (here and on the tracking tool): the answer text is what the
+# supervisor reads; the artifact (retrieved chunk ids / raw lookup results) is stored
+# on the ToolMessage but never sent to the LLM.
 @tool(response_format="content_and_artifact")
 def call_compliance_agent(state: Annotated[dict, InjectedState]) -> tuple[str, list[str]]:
     """Call when the question needs customs/import policy or FTC consumer-protection
@@ -121,14 +125,18 @@ def chunk_metadata() -> dict[str, dict]:
         return {c["chunk_id"]: c for c in (json.loads(line) for line in f)}
 
 
-def compliance_results(messages: list[BaseMessage]) -> list[tuple[str, list[str]]]:
-    """(answer, retrieved chunk ids) for every compliance call since the latest customer message."""
+def specialist_results(messages: list[BaseMessage], tool_name: str) -> list[tuple[str, list]]:
+    """(answer, artifact) for every call of one specialist since the latest customer message.
+
+    The artifact is the retrieved chunk ids (compliance) or the raw lookup results
+    (tracking); it is None for escalation, which has no sources.
+    """
     results = []
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage):
             break
-        if isinstance(msg, ToolMessage) and msg.name == "call_compliance_agent" and msg.artifact:
-            results.append((msg.content, msg.artifact))
+        if isinstance(msg, ToolMessage) and msg.name == tool_name:
+            results.append((msg.content, msg.artifact or []))
     return list(reversed(results))
 
 
@@ -140,7 +148,7 @@ def format_sources(messages: list[BaseMessage]) -> str:
     """
     metadata = chunk_metadata()
     lines: list[str] = []
-    for answer, retrieved_ids in compliance_results(messages):
+    for answer, retrieved_ids in specialist_results(messages, "call_compliance_agent"):
         for chunk_id in retrieved_ids:
             if chunk_id not in answer:
                 continue

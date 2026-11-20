@@ -1,14 +1,19 @@
-"""Groundedness eval: for each test message, does the supervisor's final reply only
-state claims actually backed by (a) the KB excerpts the compliance specialist
-retrieved and/or (b) the mocked shipment data the tracking specialist used — or
-does it slip in outside knowledge?
+"""Groundedness eval: for each test message, does the bot only state claims backed by
+what its specialists were actually given — the KB chunks the compliance specialist
+retrieved and the shipment data the tracking specialist looked up — or does it slip
+in outside knowledge?
 
-Method: LLM-as-judge. The judge sees the final reply plus the real source text
-and flags any claim in the reply not backed by that source text. The KB excerpts
-are exactly the chunks the compliance specialist was given in this run (read from
-the artifact on its ToolMessage, not retrieved again). The source list appended to
-the reply is removed before judging: it is built in code from chunk metadata, not
-written by the LLM. The judge never writes its own answer to compare
+Method: LLM-as-judge. The judge sees a text plus the source text it should be based
+on, and flags any claim not backed by that source. The sources are read from the
+artifacts on the specialists' ToolMessages (exactly what this run used; nothing is
+retrieved or looked up again). Four checks per message:
+- end-to-end: final reply vs everything the specialists were given
+- compliance specialist: its answer vs its retrieved chunks
+- tracking specialist: its answer vs its lookup results
+- supervisor: final reply vs the specialists' answers
+The per-hop checks locate where an unsupported claim came in. The source list
+appended to the reply is removed before judging: it is built in code from chunk
+metadata, not written by the LLM. The judge never writes its own answer to compare
 against — it only grades ours. This is a faithfulness/groundedness check, not an
 answer-correctness check, because there's no single correct reference answer to
 compare against for most of these questions.
@@ -32,8 +37,7 @@ from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
 from agents.graph import build_graph
-from agents.specialists import SOURCES_MARKER, chunk_metadata, compliance_results
-from agents.tools import check_shipment_status
+from agents.specialists import SOURCES_MARKER, chunk_metadata, specialist_results
 from eval.routing_eval import called_specialists
 
 load_dotenv()
@@ -42,7 +46,6 @@ MODEL = os.environ.get("AGENT_MODEL", "gpt-4o-mini")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CASES_PATH = REPO_ROOT / "data" / "eval" / "groundedness_cases.jsonl"
 
-TRACKING_REF_RE = re.compile(r"TRK\d+")
 CHUNK_ID_RE = re.compile(r"\b[a-z0-9_]+__\d{3}\b")
 
 JUDGE_SYSTEM_PROMPT = (
@@ -79,29 +82,47 @@ def load_cases() -> list[dict]:
         return [json.loads(line) for line in f]
 
 
-def build_sources(message: str, messages: list, specialists: set[str]) -> str:
-    sources = []
+COMPLIANCE = "call_compliance_agent"
+TRACKING = "call_tracking_agent"
+ESCALATION = "call_escalation_agent"
+
+
+def kb_text(chunk_ids: list[str]) -> str:
     metadata = chunk_metadata()
+    return "\n\n".join(f"[{cid}] {metadata[cid]['text']}" for cid in dict.fromkeys(chunk_ids))
 
-    retrieved_ids = [cid for _, ids in compliance_results(messages) for cid in ids]
-    if retrieved_ids:
-        unique_ids = list(dict.fromkeys(retrieved_ids))
-        excerpt_text = "\n\n".join(f"[{cid}] {metadata[cid]['text']}" for cid in unique_ids)
-        sources.append(f"KB EXCERPTS:\n{excerpt_text}")
 
-    if "call_tracking_agent" in specialists:
-        match = TRACKING_REF_RE.search(message)
-        if match:
-            result = check_shipment_status.invoke({"tracking_ref": match.group()})
-            sources.append(f"MOCKED SHIPMENT LOOKUP for {match.group()}: {result}")
+def lookup_text(lookups: list[str]) -> str:
+    return "\n".join(lookups) if lookups else "(no shipment lookup was made)"
 
-    return "\n\n".join(sources)
+
+def original_sources(messages: list) -> str:
+    """Everything the specialists were given in this run: chunks, lookup results, escalation decision."""
+    parts = []
+    chunk_ids = [cid for _, ids in specialist_results(messages, COMPLIANCE) for cid in ids]
+    if chunk_ids:
+        parts.append(f"KB EXCERPTS:\n{kb_text(chunk_ids)}")
+    lookups = [x for _, found in specialist_results(messages, TRACKING) for x in found]
+    if lookups:
+        parts.append(f"SHIPMENT LOOKUPS:\n{lookup_text(lookups)}")
+    for decision, _ in specialist_results(messages, ESCALATION):
+        parts.append(f"ESCALATION SPECIALIST DECISION:\n{decision}")
+    return "\n\n".join(parts)
+
+
+def specialist_answers(messages: list) -> str:
+    """What the supervisor was given: the specialists' answers."""
+    parts = []
+    for name, label in [(COMPLIANCE, "COMPLIANCE"), (TRACKING, "TRACKING"), (ESCALATION, "ESCALATION")]:
+        for answer, _ in specialist_results(messages, name):
+            parts.append(f"{label} SPECIALIST ANSWER:\n{answer}")
+    return "\n\n".join(parts)
 
 
 def citation_check(messages: list) -> tuple[int, int]:
     """(chunk ids the compliance specialist cited, of those how many it was NOT given)."""
     cited = invented = 0
-    for answer, retrieved_ids in compliance_results(messages):
+    for answer, retrieved_ids in specialist_results(messages, COMPLIANCE):
         for cid in set(CHUNK_ID_RE.findall(answer)):
             cited += 1
             invented += cid not in retrieved_ids
@@ -124,41 +145,61 @@ def main() -> None:
     graph = build_graph()
     judge_llm = ChatOpenAI(model=MODEL, temperature=0)
 
-    graded = 0
-    grounded_count = 0
-    total_cited = 0
-    total_invented = 0
+    # per check: [grounded, graded]
+    totals = {"end-to-end": [0, 0], "compliance specialist": [0, 0],
+              "tracking specialist": [0, 0], "supervisor": [0, 0]}
+    total_cited = total_invented = 0
+
+    def run_check(name: str, source_text: str, text: str) -> bool:
+        is_grounded, verdict_text = judge(judge_llm, source_text, text)
+        totals[name][0] += is_grounded
+        totals[name][1] += 1
+        print(f"  [{name}] {verdict_text}")
+        return is_grounded
 
     for case in cases:
         result = graph.invoke({"messages": [HumanMessage(content=case["message"])]})
-        specialists = called_specialists(result["messages"])
-        reply = result["messages"][-1].content
+        messages = result["messages"]
+        specialists = called_specialists(messages)
+        reply = messages[-1].content
         reply_text = reply.split(SOURCES_MARKER)[0]  # judge the LLM's words, not the code-built source list
 
         print(f"[{case['id']}] ({case['category']}) {case['message']}")
         print(f"  reply: {reply}")
 
-        if not specialists & {"call_compliance_agent", "call_tracking_agent"}:
+        if not specialists & {COMPLIANCE, TRACKING}:
             print("  skipped — no compliance/tracking specialist called, nothing to check\n")
             continue
 
-        source_text = build_sources(case["message"], result["messages"], specialists)
-        is_grounded, verdict_text = judge(judge_llm, source_text, reply_text)
-        graded += 1
-        grounded_count += is_grounded
+        # 1. End-to-end: final reply vs everything the specialists were given.
+        end_to_end_ok = run_check("end-to-end", original_sources(messages), reply_text)
 
-        cited, invented = citation_check(result["messages"])
+        # 2. Each hop on its own, to locate where an unsupported claim came in.
+        failed_hops = []
+        for answer, chunk_ids in specialist_results(messages, COMPLIANCE):
+            if not run_check("compliance specialist", f"KB EXCERPTS:\n{kb_text(chunk_ids)}", answer):
+                failed_hops.append("compliance specialist")
+        for answer, lookups in specialist_results(messages, TRACKING):
+            if not run_check("tracking specialist", f"SHIPMENT LOOKUPS:\n{lookup_text(lookups)}", answer):
+                failed_hops.append("tracking specialist")
+        if not run_check("supervisor", specialist_answers(messages), reply_text):
+            failed_hops.append("supervisor")
+
+        if not end_to_end_ok:
+            where = ", ".join(failed_hops) if failed_hops else "not located (the per-hop checks all passed)"
+            print(f"  -> unsupported claim introduced by: {where}")
+
+        cited, invented = citation_check(messages)
         total_cited += cited
         total_invented += invented
+        print(f"  citations: {cited} chunk id(s) cited by the compliance specialist, "
+              f"{invented} not among its retrieved chunks\n")
 
-        print(f"  {verdict_text}")
-        print(f"  citations: {cited} chunk id(s) cited by the specialist, {invented} not among its retrieved chunks\n")
-
-    if graded:
-        print(f"Grounded: {grounded_count}/{graded} graded cases ({grounded_count / graded:.0%})")
-        print(f"Citations: {total_cited} cited chunk ids, {total_invented} not among the retrieved chunks")
-    else:
-        print("No cases were graded.")
+    print("Grounded (one run):")
+    for name, (ok, n) in totals.items():
+        if n:
+            print(f"  {name:<22} {ok}/{n} ({ok / n:.0%})")
+    print(f"Citations: {total_cited} cited chunk ids, {total_invented} not among the retrieved chunks")
 
 
 if __name__ == "__main__":

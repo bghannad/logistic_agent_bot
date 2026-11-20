@@ -1,4 +1,4 @@
-"""Source list and compliance artifact — no OpenAI call, no retrieval."""
+"""Source list and specialist artifacts — no OpenAI call, no retrieval."""
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
@@ -44,3 +44,15 @@ def test_compliance_tool_returns_retrieved_ids_as_artifact(monkeypatch):
     tool_message = specialists.call_compliance_agent.invoke(tool_call)
     assert tool_message.content == "an answer"
     assert tool_message.artifact == [CITED, NOT_CITED]
+
+
+def test_tracking_tool_returns_lookup_results_as_artifact(monkeypatch):
+    monkeypatch.setattr(specialists, "tracking_agent_run", lambda _msg: ("in transit", ["TRK1001: {...}"]))
+    state = {"messages": [
+        HumanMessage(content="Where is TRK1001?"),
+        AIMessage(content="", tool_calls=[{"name": "call_tracking_agent", "args": {}, "id": "t1"}]),
+    ]}
+    tool_call = {"type": "tool_call", "name": "call_tracking_agent", "args": {"state": state}, "id": "t1"}
+    tool_message = specialists.call_tracking_agent.invoke(tool_call)
+    assert tool_message.content == "in transit"
+    assert tool_message.artifact == ["TRK1001: {...}"]
