@@ -38,10 +38,10 @@ def supervisor_node(state: MessagesState) -> dict:
 
 
 def build_graph(checkpointer=None):
-    graph = StateGraph(MessagesState)
-    graph.add_node("supervisor", supervisor_node)
+    graph = StateGraph(MessagesState) #here you define the shape of the state (“it’s a list of messages”), not the content
+    graph.add_node("supervisor", supervisor_node) # i have just 2 nodes : supervisor and specialists. 
     graph.add_node("specialists", ToolNode(_tools))
     graph.set_entry_point("supervisor")
-    graph.add_conditional_edges("supervisor", tools_condition, {"tools": "specialists", END: END})
-    graph.add_edge("specialists", "supervisor")
+    graph.add_conditional_edges("supervisor", tools_condition, {"tools": "specialists", END: END}) # After supervisor, ask tools_condition where to go. If it says "tools", go to "specialists". If it says END, go to END.
+    graph.add_edge("specialists", "supervisor") # after specialist always come back to supervisor
     return graph.compile(checkpointer=checkpointer)
