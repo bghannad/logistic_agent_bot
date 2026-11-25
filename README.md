@@ -50,6 +50,17 @@ All three evaluations use small, hand-labeled test sets written against the real
 
 **Retrieval** (18 hand-labeled questions, each with a known-correct chunk): Hit@5 17/18 (94%), Recall@5 0.92, Precision@5 0.26 against a ceiling of 0.29 for this test set. (Precision@5 is capped low by construction — each question has only 1–3 correct chunks out of 5 returned slots — so 0.26 is close to the best this metric could show here; Hit@5 and Recall@5 are the more meaningful numbers.)
 
+**Stage-wise retrieval check** (`python scripts/diagnose_retrieval.py all`; same 18 questions, one run). Each stage's own top 5, scored separately:
+
+| Stage | Hit@5 | Recall@5 | MRR |
+|---|---|---|---|
+| BM25 only | 17/18 | 0.89 | 0.77 |
+| Embeddings only | 18/18 | 0.94 | 0.91 |
+| RRF, no reranker | 18/18 | 0.92 | 0.92 |
+| Full pipeline (RRF + reranker) | 17/18 | 0.92 | 0.89 |
+
+RRF without the reranker already finds a correct chunk for all 18 questions, so the full pipeline's one miss is introduced by the cross-encoder reranker. The test questions are few and fairly easy, so the reranker stays for now; the next step is a harder question set (paraphrases, typos, vague questions), then a data-based decision on whether it earns its place.
+
 **Routing** (18 hand-labeled customer messages, each with the specialist(s) that should be called): 17/18 (94%) exact match.
 
 **Groundedness / hallucination check** (12 hand-labeled messages, LLM-as-judge): 11/12 after one round of fixing the judge's own prompt (its first pass had penalized the system for honestly saying "not in my knowledge base," and for generic advice, as if those were unsupported claims). The one remaining flag is borderline, not a clear invention: the reply said "gold items" where the source specifically says "gold coins, medals and bullion" — a mild broadening. Limitations: the judge prompt was tuned on the same 12 cases it scores, and replies vary between runs (on a separate run, one reply made a claim the bot had no way to verify), so this is a sample, not a guarantee. The judge's verdicts were checked by hand.
