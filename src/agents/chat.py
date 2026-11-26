@@ -11,8 +11,9 @@ from __future__ import annotations
 import sys
 
 from langchain_core.messages import HumanMessage
+from langgraph.errors import GraphRecursionError
 
-from agents.graph import build_graph
+from agents.graph import FALLBACK_REPLY, build_graph
 from agents.tracing import flush, get_callbacks
 
 
@@ -24,10 +25,15 @@ def main() -> None:
     print(f"Customer: {message}\n")
 
     graph = build_graph()
-    result = graph.invoke(
-        {"messages": [HumanMessage(content=message)]},
-        config={"callbacks": get_callbacks()},
-    )
+    try:
+        result = graph.invoke(
+            {"messages": [HumanMessage(content=message)]},
+            config={"callbacks": get_callbacks()},
+        )
+    except GraphRecursionError:  # supervisor kept calling specialists past RECURSION_LIMIT
+        print(f"Supervisor reply:\n{FALLBACK_REPLY}")
+        flush()
+        return
 
     for msg in result["messages"]:
         role = msg.__class__.__name__

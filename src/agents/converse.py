@@ -18,8 +18,9 @@ import uuid
 
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.errors import GraphRecursionError
 
-from agents.graph import build_graph
+from agents.graph import FALLBACK_REPLY, build_graph
 from agents.tracing import flush, get_callbacks, session_metadata
 
 
@@ -40,8 +41,12 @@ def main() -> None:
         if not user_input:
             continue
 
-        result = graph.invoke({"messages": [HumanMessage(content=user_input)]}, config=config)
-        print(f"\nBot: {result['messages'][-1].content}\n")
+        try:
+            result = graph.invoke({"messages": [HumanMessage(content=user_input)]}, config=config)
+            reply = result["messages"][-1].content
+        except GraphRecursionError:  # supervisor kept calling specialists past RECURSION_LIMIT
+            reply = FALLBACK_REPLY
+        print(f"\nBot: {reply}\n")
 
     flush()
 

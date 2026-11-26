@@ -32,6 +32,16 @@ from agents.specialists import (
 load_dotenv()
 MODEL = os.environ.get("AGENT_MODEL", "gpt-4o-mini")
 
+# Hard stop for the supervisor <-> specialists loop. Every node run is one step, so 10
+# allows at most 5 supervisor/specialist rounds per customer message. Kept even on
+# purpose: the 10th step is always the specialists node, so a stopped run never leaves
+# the supervisor's tool calls unanswered in the conversation's saved history.
+RECURSION_LIMIT = 10
+FALLBACK_REPLY = (
+    "Sorry, I couldn't resolve this automatically. "
+    "Please contact our support team so a colleague can help you."
+)
+
 _tools = [call_tracking_agent, call_compliance_agent, call_escalation_agent]
 _supervisor_llm = ChatOpenAI(model=MODEL, temperature=0).bind_tools(_tools)
 
@@ -53,4 +63,5 @@ def build_graph(checkpointer=None):
     graph.set_entry_point("supervisor")
     graph.add_conditional_edges("supervisor", tools_condition, {"tools": "specialists", END: END}) # After supervisor, ask tools_condition where to go. If it says "tools", go to "specialists". If it says END, go to END.
     graph.add_edge("specialists", "supervisor") # after specialist always come back to supervisor
-    return graph.compile(checkpointer=checkpointer)
+    # with_config binds the limit to every invoke() that doesn't pass its own
+    return graph.compile(checkpointer=checkpointer).with_config(recursion_limit=RECURSION_LIMIT)

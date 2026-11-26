@@ -19,9 +19,10 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel
 
-from agents.graph import build_graph
+from agents.graph import FALLBACK_REPLY, build_graph
 from agents.tracing import flush, get_callbacks, session_metadata
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -53,6 +54,10 @@ def chat(req: ChatRequest) -> ChatResponse:
         "callbacks": get_callbacks(),
         "metadata": session_metadata(req.session_id),
     }
-    result = _graph.invoke({"messages": [HumanMessage(content=req.message)]}, config=config)
+    try:
+        result = _graph.invoke({"messages": [HumanMessage(content=req.message)]}, config=config)
+        reply = result["messages"][-1].content
+    except GraphRecursionError:  # supervisor kept calling specialists past RECURSION_LIMIT
+        reply = FALLBACK_REPLY
     flush()
-    return ChatResponse(reply=result["messages"][-1].content)
+    return ChatResponse(reply=reply)
